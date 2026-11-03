@@ -17,12 +17,39 @@ from octop_gateway.models import (
 )
 from octop_gateway.utils import (
     Debouncer,
+    close_event_stream,
     extract_media,
     extract_text,
     has_media,
     has_text,
     merge_messages,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["ok", "hang", "raise"])
+async def test_close_event_stream_runs_and_bounds_finalizers(mode, monkeypatch, caplog):
+    closed = asyncio.Event()
+
+    async def events():
+        try:
+            yield "error"
+        finally:
+            try:
+                if mode == "hang":
+                    await asyncio.Event().wait()
+                if mode == "raise":
+                    raise RuntimeError("simulated cleanup failure")
+            finally:
+                closed.set()
+
+    monkeypatch.setattr("octop_gateway.utils.STREAM_CLOSE_TIMEOUT", 0.01)
+    stream = events()
+    assert await anext(stream) == "error"
+    await asyncio.wait_for(close_event_stream(stream), timeout=0.5)
+    assert closed.is_set()
+    if mode != "ok":
+        assert "cleanup timed out" in caplog.text if mode == "hang" else "cleanup failed" in caplog.text
 
 
 class TestContentHelpers:
@@ -78,6 +105,21 @@ class TestContentHelpers:
 
 class TestMergeMessages:
     """Test message merging."""
+
+    @pytest.mark.parametrize(
+        "first, second, expected",
+        [(None, [], []), ([], None, []), (["read_file", "web_fetch"], ["web_fetch"], ["web_fetch"])],
+    )
+    def test_merging_never_widens_tool_permissions(
+        self, first: list[str] | None, second: list[str] | None, expected: list[str]
+    ) -> None:
+        messages = [
+            InboundMessage(channel_id="test", content=[TextContent(text="first")], allowed_tools=first),
+            InboundMessage(channel_id="test", content=[TextContent(text="second")], allowed_tools=second),
+        ]
+        merged = merge_messages(messages)
+        assert merged.allowed_tools == expected
+        assert merged.text == "first\nsecond"
 
     def test_merge_single(self) -> None:
         msg = InboundMessage(

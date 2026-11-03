@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from octop_gateway.models import (
@@ -19,6 +19,28 @@ from octop_gateway.models import (
 )
 
 logger = logging.getLogger(__name__)
+STREAM_CLOSE_TIMEOUT = 5.0
+
+
+async def close_event_stream(stream: AsyncIterator[Any]) -> None:
+    """Run an event producer's finalizers without waiting for another event.
+
+    ERROR is terminal. Explicit close preserves host cleanup when the consumer
+    stops at ERROR; a stalled finalizer is cancelled after five seconds. The
+    caller must release local running/typing state in its own finally block.
+    Iterators without an optional ``aclose`` need no explicit close.
+    """
+    close = getattr(stream, "aclose", None)
+    if close is None:
+        return
+    try:
+        async with asyncio.timeout(STREAM_CLOSE_TIMEOUT):
+            await close()
+    except TimeoutError:
+        logger.warning("Event stream cleanup timed out")
+    except Exception:
+        logger.exception("Event stream cleanup failed")
+
 
 _MEDIA_TYPES = frozenset({ContentType.IMAGE, ContentType.VIDEO, ContentType.AUDIO, ContentType.FILE})
 
@@ -78,8 +100,13 @@ def merge_messages(messages: list[InboundMessage]) -> InboundMessage:
     merged_content: list[ContentPart] = []
     merged_meta: dict[str, Any] = dict(messages[0].metadata)
     earliest_ts = messages[0].timestamp
+    allowed_tools: set[str] | None = None
 
     for msg in messages:
+        if msg.allowed_tools is not None:
+            allowed_tools = (
+                set(msg.allowed_tools) if allowed_tools is None else allowed_tools.intersection(msg.allowed_tools)
+            )
         merged_content.extend(msg.content)
         earliest_ts = min(earliest_ts, msg.timestamp)
         # Merge metadata (later messages may add keys)
@@ -92,6 +119,7 @@ def merge_messages(messages: list[InboundMessage]) -> InboundMessage:
             "content": merged_content,
             "metadata": merged_meta,
             "timestamp": earliest_ts,
+            "allowed_tools": sorted(allowed_tools) if allowed_tools is not None else None,
         }
     )
 

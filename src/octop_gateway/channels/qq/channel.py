@@ -43,7 +43,7 @@ from octop_gateway.models import (
     TextContent,
     VideoContent,
 )
-from octop_gateway.utils import extract_media, extract_text
+from octop_gateway.utils import close_event_stream, extract_media, extract_text
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +217,7 @@ class QQConfig(ChannelConfig):
             activation="mention",
             history="recent",
             history_limit=10,
+            owner_commands_only=True,
         )
     )
 
@@ -240,6 +241,8 @@ class QQConfig(ChannelConfig):
         raw_group_context = data.get("group_context")
         if isinstance(raw_group_context, dict) and "enabled" not in raw_group_context:
             config.group_context.enabled = True
+        if isinstance(raw_group_context, dict) and "owner_commands_only" not in raw_group_context:
+            config.group_context.owner_commands_only = True
         return config
 
     @classmethod
@@ -647,6 +650,7 @@ class QQChannel(BaseChannel):
         )
         self._active_c2c_stream = session
         text_parts: list[str] = []
+        answer_prefix = ""
         thinking_parts: list[str] = []
         media_buffer: list[ContentPart] = []
         processing_succeeded = False
@@ -682,6 +686,7 @@ class QQChannel(BaseChannel):
                 text_parts.append(visible)
 
         def _locked_stream_text(text: str) -> str:
+            text = answer_prefix + text
             accepted = session._prefix_base()
             if accepted.startswith(_C2C_STREAM_HOLD) and not text.startswith(_C2C_STREAM_HOLD):
                 text = _C2C_STREAM_HOLD + text
@@ -735,8 +740,10 @@ class QQChannel(BaseChannel):
             if text:
                 await _deliver_static(text)
 
+        events = None
         try:
-            async for event in self._processor(message):
+            events = self._processor(message)
+            async for event in events:
                 if event.type == MessageEventType.DELTA:
                     await _flush_thinking()
                     for part in event.content:
@@ -779,6 +786,9 @@ class QQChannel(BaseChannel):
                     await _flush_thinking()
                     text_parts.clear()
                     session.discard_unsent()
+                    # QQ cannot remove accepted or in-flight narration. Freeze
+                    # that prefix once so each new answer snapshot extends it.
+                    answer_prefix = session._prefix_base()
                     if show_tool_hints:
                         hint = tool_hint_message(event.metadata, self._constraints, phase="start")
                         if hint:
@@ -834,6 +844,8 @@ class QQChannel(BaseChannel):
             if not session.closing:
                 with contextlib.suppress(Exception):
                     await session.finish(session.last_accepted, discard_pending=True)
+            if events is not None:
+                await close_event_stream(events)
 
     @staticmethod
     def _extract_stream_id(payload: dict[str, Any]) -> str | None:
